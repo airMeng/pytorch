@@ -454,6 +454,7 @@ Tensor& tensordot_out(
 
 TORCH_LIBRARY_IMPL(aten, XPU, m) {
   m.impl("tensordot.out", TORCH_FN(tensordot_out));
+  m.impl("_weight_int4pack_mm", TORCH_FN(_weight_int4pack_mm_xpu));
 }
 } // namespace xpu
 
