@@ -610,21 +610,7 @@ Tensor _scaled_mm(const Tensor& mat_a, const Tensor& mat_b,
 }
 
 TORCH_LIBRARY_IMPL(aten, XPU, m){
-  m.impl("addmm.out", TORCH_FN(addmm_out));
-  m.impl("_addmm_activation.out", TORCH_FN(_addmm_activation_out));
-  m.impl("mm.out", TORCH_FN(mm_out));
-  m.impl("mm", TORCH_FN(mm));
-  m.impl("baddbmm.out", TORCH_FN(baddbmm_out));
-  m.impl("baddbmm_", TORCH_FN(baddbmm_));
-  m.impl("baddbmm", TORCH_FN(baddbmm));
-  m.impl("addbmm.out", TORCH_FN(addbmm_out));
-  m.impl("addbmm_", TORCH_FN(addbmm_));
-  m.impl("addbmm", TORCH_FN(addbmm));
-  m.impl("bmm.out", TORCH_FN(bmm_out));
-  m.impl("bmm", TORCH_FN(bmm));
-  m.impl("addmv.out", TORCH_FN(addmv_out));
   m.impl("tensordot.out", TORCH_FN(tensordot_out));
-  m.impl("_scaled_mm", TORCH_FN(_scaled_mm));
 }
 } // namespace xpu
 
