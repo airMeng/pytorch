@@ -597,7 +597,7 @@ _scaled_mm_out_xpu(const Tensor& mat1, const Tensor& mat2,
   return out;
 }
 
-Tensor& _scaled_mm(const Tensor& mat_a, const Tensor& mat_b,
+Tensor _scaled_mm(const Tensor& mat_a, const Tensor& mat_b,
           const Tensor& scale_a,
           const Tensor& scale_b,
           const std::optional<at::Tensor>& bias,
