@@ -92,7 +92,7 @@ class TestOneDNNInt4Linear(TestCase):
         zero_points = torch.Tensor([8]).to(torch.int8).to("xpu")
         weight_ba = weight.transpose(0, 1).contiguous().transpose(0, 1)
 
-        out_onednn = torch.ops.torch_ipex.mm_int4(
+        out_onednn =torch.ops.aten._weight_int4pack_mm_with_scales_and_zeros(
             input, weight_ba, scales, zero_points, group_size
         )
         out_torch = torch.matmul(input_torch, weight_fp)

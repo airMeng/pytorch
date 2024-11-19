@@ -1,11 +1,13 @@
+
 #include <c10/xpu/XPUFunctions.h>
 
-#include <ATen/native/mkldnn/xpu/detail/Attr.h>
-#include <ATen/native/mkldnn/xpu/detail/Utils.h>
+#include <ATen/ATen.h>
+#include <ATen/record_function.h>
+
+#include <Attr.h>
+#include <Utils.h>
 
 #include <oneapi/dnnl/dnnl.hpp>
-#include <cstdint>
-
 
 namespace at::native::onednn {
 
@@ -24,8 +26,9 @@ sycl::event woq_matmul_int4(
     const Tensor& scale, // [K/group_size, N] ao: [N1, K]
     const Tensor& zp, // [k/group_size, N/8] ao: [N1, K]
     int64_t group_size,
+    bool m2_trans,
     Attr attr,
-    // const c10::optional<Tensor>& g_idx,
+    // const c10::optional<Tensor>& g_idx,  // disable input_order
     const std::vector<sycl::event>& deps,
     Tensor b_raw) {
   Tensor mat1;
@@ -34,103 +37,97 @@ sycl::event woq_matmul_int4(
   // } else {
   //   mat1 = mat1_.flatten(0, -2);
   // }
-  // auto mat2 = mat2_.flatten(0, -2);
-  // int m = mat1.sizes()[0];
-  // int n = mat2.sizes()[1];
-  // int k = mat1.sizes()[1];
-  // result = at::empty({m, n}, mat1_.options());
-  size_t dims = result.dim();
+  auto mat2 = mat2_.flatten(0, -2);
+  auto m = mat1.sizes()[0];
+  auto n = mat2.sizes()[1];
+  auto k = mat1.sizes()[1];
+  result = at::empty({m, n}, mat1_.options());
+  uint64_t dims = result.dim();
   TORCH_CHECK(
       dims == 2 || dims == 3,
       "oneDNN matmul only works with 2D or 3D, got ",
       dims);
-  // TORCH_CHECK(
-  //     dims == mat1.dim() && dims == mat2.dim(),
-  //     "oneDNN input matrixes must have the same ranks");
+  TORCH_CHECK(
+      result.dim() == mat1.dim() && result.dim() == mat2.dim(),
+      "oneDNN input matrixes must have the same ranks");
   TORCH_CHECK(result.defined(), "oneDNN matmul result should be defined");
 
   at::Device curDevice = at::Device(at::kXPU, at::xpu::current_device());
   auto engine = GpuEngineManager::Instance().get_engine(curDevice);
-  auto engine_index = curDevice.index();
   auto stream = GpuStreamManager::Instance().get_stream();
 
   // make them all contiguous
-  // Tensor m1 = is_onednn_matmul_strides(mat1) ? mat1 : mat1.contiguous();
-  Tensor m1 = mat1_;
-  Tensor m2 = mat2_;
-  // Tensor m2 = is_onednn_matmul_strides(mat2) ? mat2 : mat2.contiguous();
+  Tensor m1 = is_onednn_matmul_strides(mat1) ? mat1 : mat1.contiguous();
+  Tensor m2 = is_onednn_matmul_strides(mat2) ? mat2 : mat2.contiguous();
   Tensor scale_ = is_onednn_matmul_strides(scale) ? scale : scale.contiguous();
   Tensor zp_ = is_onednn_matmul_strides(zp) ? zp : zp.contiguous();
   Tensor dst = is_onednn_matmul_strides(result, true) ? result : result.contiguous();
 
-  constexpr int64_t kNTileSize = 8;
-  // m = dst.size(-2);
-  int m = m1.size(0); // M
-  // n = dst.size(-1);
-  int n = m2.size(0) * kNTileSize; // N1
-  int k = m1.size(1); // K1
+  m = dst.size(-2);
+  n = dst.size(-1);
+  k = m1.size(1); // K1
   int64_t mb = 1;
 
-//   if (dims == 3) {
-//     mb = dst.size(0);
-//     TORCH_CHECK(
-//         mb == m1.size(0) && mb == m2.size(0),
-//         "batch size mismatch, dst mb: ",
-//         mb,
-//         "m1 mb",
-//         m1.size(0),
-//         " m2 mb: ",
-//         m2.size(0));
-//   }
+  if (dims == 3) {
+    mb = dst.size(0);
+    TORCH_CHECK(
+        mb == m1.size(0) && mb == m2.size(0),
+        "batch size mismatch, dst mb: ",
+        mb,
+        "m1 mb",
+        m1.size(0),
+        " m2 mb: ",
+        m2.size(0));
+  }
 
   // validate bias and make it compatible with oneDNN implementation
   bool with_bias = false;
-  // Tensor b = b_raw;
-  // if (b.defined()) {
-  //   with_bias = true;
-  //   if (b.dim() == 1) {
-  //     TORCH_CHECK(
-  //         b.size(0) == n || b.size(0) == 1,
-  //         "matmul supports [n] or [1] when bias dim is 1 ...");
-  //     if (b.size(0) == 0) {
-  //       with_bias = false;
-  //     } else if (m1.dim() == 3) {
-  //       b = b.expand({mb, m, n}).contiguous();
-  //     } else if (m1.dim() == 2) {
-  //       b = b.expand({1, n}).contiguous();
-  //     }
-  //   } else if (b.dim() == 2) {
-  //     TORCH_CHECK(
-  //         (b.size(0) == m && b.size(1) == n) ||
-  //             (b.size(0) == 1 && b.size(1) == n) ||
-  //             (b.size(0) == m && b.size(1) == 1) ||
-  //             (b.size(0) == 1 && b.size(1) == 1),
-  //         "matmul supports [m, n] or [1, n] or [m, 1] or [1, 1] when bias dim is 2 ...");
-  //     if (b.size(0) == 1 && b.size(1) == 1)
-  //       b = b.expand({1, n}).contiguous();
-  //   } else if (b.dim() == 3) {
-  //     TORCH_CHECK(
-  //         are_expandable({mb, m, n}, b.sizes()),
-  //         "matmul bias must be expandable to:",
-  //         dst.sizes(),
-  //         " but got:",
-  //         b.sizes());
-  //     b = b.expand({mb, m, n}).contiguous();
-  //   } else if (b.dim() == 0) {
-  //     TORCH_CHECK(
-  //         b.numel() == 1, "matmul supports 1 numel when bias dim is [] ...");
-  //     if (m1.dim() == 3) {
-  //       b = b.expand({mb, m, n}).contiguous();
-  //     } else {
-  //       b = b.expand({1, n}).contiguous();
-  //     }
-  //   } else {
-  //     TORCH_CHECK(0, "unsupported bias dim in matmul ...");
-  //   }
-  // }
+  Tensor b = b_raw;
+  if (b.defined()) {
+    with_bias = true;
+    if (b.dim() == 1) {
+      TORCH_CHECK(
+          b.size(0) == n || b.size(0) == 1,
+          "matmul supports [n] or [1] when bias dim is 1 ...");
+      if (b.size(0) == 0) {
+        with_bias = false;
+      } else if (m1.dim() == 3) {
+        b = b.expand({mb, m, n}).contiguous();
+      } else if (m1.dim() == 2) {
+        b = b.expand({1, n}).contiguous();
+      }
+    } else if (b.dim() == 2) {
+      TORCH_CHECK(
+          (b.size(0) == m && b.size(1) == n) ||
+              (b.size(0) == 1 && b.size(1) == n) ||
+              (b.size(0) == m && b.size(1) == 1) ||
+              (b.size(0) == 1 && b.size(1) == 1),
+          "matmul supports [m, n] or [1, n] or [m, 1] or [1, 1] when bias dim is 2 ...");
+      if (b.size(0) == 1 && b.size(1) == 1)
+        b = b.expand({1, n}).contiguous();
+    } else if (b.dim() == 3) {
+      TORCH_CHECK(
+          are_expandable({mb, m, n}, b.sizes()),
+          "matmul bias must be expandable to:",
+          dst.sizes(),
+          " but got:",
+          b.sizes());
+      b = b.expand({mb, m, n}).contiguous();
+    } else if (b.dim() == 0) {
+      TORCH_CHECK(
+          b.numel() == 1, "matmul supports 1 numel when bias dim is [] ...");
+      if (m1.dim() == 3) {
+        b = b.expand({mb, m, n}).contiguous();
+      } else {
+        b = b.expand({1, n}).contiguous();
+      }
+    } else {
+      TORCH_CHECK(0, "unsupported bias dim in matmul ...");
+    }
+  }
 
-  // // bias is fused in post-op for quantized path
-  // b = b.contiguous(); // avoid reorder 2 times
+  // bias is fused in post-op for quantized path
+  b = b.contiguous(); // avoid reorder 2 times
 
   // should be bf16
   auto m1_usr_dt = get_onednn_dtype(m1); // half <==> f16
@@ -161,8 +158,8 @@ sycl::event woq_matmul_int4(
   dnnl::memory::dims m1_strides, m2_strides, m2_usr_strides, scale_strides,
       zp_strides, zp_usr_strides, dst_strides, bias_strides;
 
-  const uint64_t num_groups = (uint64_t)(k / group_size);
-  const uint64_t compressed_k = (uint64_t)(k / 8);
+  const int64_t num_groups = (uint64_t)(k / group_size);
+  const int64_t compressed_k = (uint64_t)(k / 8);
 
   m2_usr_dims = {compressed_k, n};
   scale_dims = {num_groups, n};
@@ -174,33 +171,31 @@ sycl::event woq_matmul_int4(
   zp_strides = {1};
   zp_usr_strides = {1};
 
-  // if (dims == 2) {
-  m1_dims = {m, k};
-  m2_dims = {k, n};
-  dst_dims = {m, n};
+  if (dims == 2) {
+    m1_dims = {m, k};
+    m2_dims = {k, n};
+    dst_dims = {m, n};
 
-  m1_strides = {m1.stride(0), m1.stride(1)};
-  m2_strides = {n, 1};
-  dst_strides = {dst.stride(0), dst.stride(1)};
-  // } else {
-  //   m1_dims = {mb, m, k};
-  //   m2_dims = {mb, k, n};
-  //   dst_dims = {mb, m, n};
-
-  //   m1_strides = {m1.stride(0), m1.stride(1), m1.stride(2)};
-  //   if (m2_trans) {
-  //     m2_strides = {m2.stride(0), m2.stride(1), m2.stride(2)};
-  //   } else {
-  //     m2_strides = {m2.stride(0), m2.stride(2), m2.stride(1)};
-  //   }
-  //   dst_strides = {dst.stride(0), dst.stride(1), dst.stride(2)};
-  // }
-
-  // if (with_bias) {
-  //   bias_dims = get_onednn_dims(b);
-  //   bias_dt = get_onednn_dtype(b);
-  //   bias_strides = get_onednn_strides(b);
-  // }
+    m1_strides = {m1.stride(0), m1.stride(1)};
+    m2_strides = {n, 1};
+    dst_strides = {dst.stride(0), dst.stride(1)};
+  } else {
+    m1_dims = {mb, m, k};
+    m2_dims = {mb, k, n};
+    dst_dims = {mb, m, n};
+    m1_strides = {m1.stride(0), m1.stride(1), m1.stride(2)};
+    if (m2_trans) {
+      m2_strides = {m2.stride(0), m2.stride(1), m2.stride(2)};
+    } else {
+      m2_strides = {m2.stride(0), m2.stride(2), m2.stride(1)};
+    }
+    dst_strides = {dst.stride(0), dst.stride(1), dst.stride(2)};
+  }
+  if (with_bias) {
+    bias_dims = get_onednn_dims(b);
+    bias_dt = get_onednn_dtype(b);
+    bias_strides = get_onednn_strides(b);
+  }
 
   std::unordered_map<int, dnnl::memory> args;
 
@@ -224,12 +219,12 @@ sycl::event woq_matmul_int4(
       engine,
       handle_b);
 
+
   m1_md = dnnl::memory::desc(m1_dims, m1_dt, m1_strides);
   m2_md = dnnl::memory::desc(m2_dims, m2_dt, m2_strides);
   scale_md = dnnl::memory::desc(scale_dims, scale_dt, scale_strides);
   zp_md = dnnl::memory::desc(zp_dims, zp_dt, zp_strides);
   dst_md = dnnl::memory::desc(dst_dims, dst_dt, dst_strides);
-  
   // STEP2: creat attribute
   dnnl::primitive_attr pattr;
   pattr.set_post_ops(po);
@@ -244,29 +239,20 @@ sycl::event woq_matmul_int4(
       {group_size, 1},
       scale_dt);
   // Set a single zero point with s8 data type.
-  // pattr.set_zero_points(
-  //     DNNL_ARG_WEIGHTS,
-  //     /* mask */ 0,
-  //     {},
-  //     dnnl::memory::data_type::bf16);
   pattr.set_zero_points(
-    DNNL_ARG_WEIGHTS,
-    /*mask*/ (1<<0) + (1<<1),
-    {group_size, 1},
-    dnnl::memory::data_type::bf16
-  );
-  // Set fpmath mode with `apply_to_int=true` to apply fpmath mode behavior to
-  // integral primitives (in this example, matmul).
-  pattr.set_fpmath_mode(dnnl::fpmath_mode::f16, true);
+      DNNL_ARG_WEIGHTS,
+      /* mask */ 0,
+      {},
+      dnnl::memory::data_type::s8);
 
-  // if (with_bias) {
-  //   b_md = dnnl::memory::desc(bias_dims, bias_dt, bias_strides);
-  //   matmul_pd = dnnl::matmul::primitive_desc(
-  //       engine, m1_md, m2_u4_m.get_desc(), b_md, dst_md, pattr);
-  // } else {
-  matmul_pd = dnnl::matmul::primitive_desc(
-        engine, m1_md, m2_u4_m.get_desc(), dst_md, pattr);
-  // }
+  if (with_bias) {
+    b_md = dnnl::memory::desc(bias_dims, bias_dt, bias_strides);
+    matmul_pd = dnnl::matmul::primitive_desc(
+        engine, m1_md, m2_u4_m.get_desc(), b_md, dst_md, pattr);
+  } else {
+    matmul_pd = dnnl::matmul::primitive_desc(
+          engine, m1_md, m2_u4_m.get_desc(), dst_md, pattr);
+  }
 
   matmul_p = dnnl::matmul(matmul_pd);
 
@@ -274,12 +260,15 @@ sycl::event woq_matmul_int4(
   auto scale_usr_m = make_onednn_memory(scale_usr_md, engine, scale.data_ptr());
   auto zp_usr_m = make_onednn_memory(zp_usr_md, engine, zp.data_ptr());
 
+  auto expected_m1_md = matmul_pd.src_desc();
+  auto expected_m2_md = matmul_pd.weights_desc();
+  auto expected_dst_md = matmul_pd.dst_desc();
+
   dnnl::memory m1_m = m1_usr_m, m2_m = m2_u4_m, dst_m = dst_usr_m;
   dnnl::memory scale_m = scale_usr_m; // zp_m = zp_u4_m;
   Tensor m1_, m2_, zp_new, dst_;
 
-
-  int scratchpad_size = matmul_pd.scratchpad_desc().get_size();
+  int64_t scratchpad_size = matmul_pd.scratchpad_desc().get_size();
   Tensor scratchpad_tensor = at::empty(
       {scratchpad_size}, m1.options().dtype(at::kByte), c10::nullopt);
   auto scratchpad_memory = make_onednn_memory(
@@ -292,19 +281,19 @@ sycl::event woq_matmul_int4(
   args.insert({DNNL_ARG_SRC, m1_m});
   args.insert({DNNL_ARG_WEIGHTS, m2_u4_m});
   args.insert({DNNL_ARG_DST, dst_m});
-  // if (b.defined()) {
-  //   auto b_m = make_onednn_memory(b_md, engine, b.data_ptr());
-  //   args.insert({DNNL_ARG_BIAS, b_m});
-  // }
+  if (b.defined()) {
+    auto b_m = make_onednn_memory(b_md, engine, b.data_ptr());
+    args.insert({DNNL_ARG_BIAS, b_m});
+  }
   // add scale & zp
   // dnnl::memory zp_m({{1}, dnnl::memory::data_type::s8, {1}}, engine);
   args.insert({DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, scale_m});
   args.insert({DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_WEIGHTS, zp_usr_m});
 
   sycl::event matmul_event = dnnl::sycl_interop::execute(matmul_p, stream, args, deps);
-  // if (!dst.is_same(result))
-  //   result.copy_(dst);
-  // result = resize_as_onednn_mat1(mat1_, result);
+  if (!dst.is_same(result))
+    result.copy_(dst);
+  result = resize_as_onednn_mat1(mat1_, result);
 
   return matmul_event;
 }
