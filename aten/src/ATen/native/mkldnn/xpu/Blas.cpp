@@ -452,9 +452,55 @@ Tensor& tensordot_out(
   return result;
 }
 
+at::Tensor _weight_int4pack_mm_with_scales_and_zeros_xpu(
+    const at::Tensor& A, // src, [M, K]
+    const at::Tensor& B, // wei, [K/8, N]
+    int64_t qGroupSize,
+    const at::Tensor& qScale, // [k/group_size, N]
+    const at::Tensor& qZeros // [k/group_size, N/8]
+  ) {
+  TORCH_CHECK(
+      A.device() == B.device() &&
+      A.device() == qScale.device() &&
+      A.device() == qZeros.device());
+  int m = A.size(0);
+  int n = B.size(1);
+  int k = A.size(1);
+
+  // A is standard row major
+  TORCH_CHECK(A.dtype() == at::kBFloat16 || A.dtype() == at::kHalf);
+  TORCH_CHECK(A.is_contiguous());
+  TORCH_CHECK(A.dim() == 2);
+
+  // B is a packed matrix with 8 int4 packed into a single int
+  TORCH_CHECK(
+      B.size(0) == k / 8,
+      "B should have size (k/8, N), got ",
+      B.sizes());
+  TORCH_CHECK(B.dtype() == at::kInt);
+  TORCH_CHECK(B.is_contiguous());
+
+  // Validate the scale and zero point tensor for dequantization
+  // These are the only versions handled at the moment
+  TORCH_CHECK(
+      qGroupSize == 32 || qGroupSize == 64 || qGroupSize == 128 ||
+      qGroupSize == 256);
+
+  TORCH_CHECK(qScale.size(0) == k / qGroupSize && qScale.size(1) == n,
+  "qScale should have size (k/group_size, N), got ", qScale.sizes());
+  TORCH_CHECK(qZeros.size(0) == k / qGroupSize && qZeros.size(1) == n / 8,
+  "qZeros should have size (k/group_size, N/8), got ", qZeros.sizes());
+
+  // Output is a standard row-major matrix
+  auto C_final = at::empty(
+      {m, n}, at::TensorOptions().dtype(at::kBFloat16).device(A.device()));
+  onednn::woq_matmul_int4(C_final, A, B, qScale, qZeros, false, qGroupSize, onednn::Attr());
+  return C_final;
+  }
+
 TORCH_LIBRARY_IMPL(aten, XPU, m) {
   m.impl("tensordot.out", TORCH_FN(tensordot_out));
-  m.impl("_weight_int4pack_mm_with_scale_and_zeros", TORCH_FN(_weight_int4pack_mm_with_scale_and_zeros));
+  m.impl("_weight_int4pack_mm_with_scale_and_zeros", TORCH_FN(_weight_int4pack_mm_with_scales_and_zeros_xpu));
 }
 } // namespace xpu
 
@@ -513,50 +559,13 @@ TORCH_IMPL_FUNC(addmv_out_xpu)
   xpu::addmv_out(self, mat, vec, beta, alpha, const_cast<Tensor&>(result));
 }
 
-at::Tensor _weight_int4pack_mm_with_scales_and_zeros_xpu(
-    const at::Tensor& A, // src, [M, K]
-    const at::Tensor& B, // wei, [K/8, N]
-    int64_t qGroupSize,
-    const at::Tensor& qScale, // [k/group_size, N]
-    const at::Tensor& qZeros // [k/group_size, N/8]
-  ) {
-  TORCH_CHECK(
-      A.device() == B.device() &&
-      A.device() == qScale.device() &&
-      A.device() == qZeros.device());
-  int m = A.size(0);
-  int n = B.size(1);
-  int k = A.size(1);
-
-  // A is standard row major
-  TORCH_CHECK(A.dtype() == at::kBFloat16 || A.dtype() == at::kHalf);
-  TORCH_CHECK(A.is_contiguous());
-  TORCH_CHECK(A.dim() == 2);
-
-  // B is a packed matrix with 8 int4 packed into a single int
-  TORCH_CHECK(
-      B.size(0) == k / 8,
-      "B should have size (k/8, N), got ",
-      B.sizes());
-  TORCH_CHECK(B.dtype() == at::kInt);
-  TORCH_CHECK(B.is_contiguous());
-
-  // Validate the scale and zero point tensor for dequantization
-  // These are the only versions handled at the moment
-  TORCH_CHECK(
-      qGroupSize == 32 || qGroupSize == 64 || qGroupSize == 128 ||
-      qGroupSize == 256);
-
-  TORCH_CHECK(qScale.size(0) == k / qGroupSize && qScale.size(1) == n,
-  "qScale should have size (k/group_size, N), got ", qScale.sizes());
-  TORCH_CHECK(qZeros.size(0) == k / qGroupSize && qZeros.size(1) == n / 8,
-  "qZeros should have size (k/group_size, N/8), got ", qZeros.sizes());
-
-  // Output is a standard row-major matrix
-  auto C_final = at::empty(
-      {m, n}, at::TensorOptions().dtype(at::kBFloat16).device(A.device()));
-  onednn::woq_matmul_int4(C_final, A, B, qScale, qZeros, false, qGroupSize, onednn::Attr());
-  return C_final;
+at::Tensor  _weight_int4pack_mm_with_scales_and_zeros_xpu(
+ const at::Tensor& A, // src, [M, K]
+ const at::Tensor& B, // wei, [K/8, N]
+ int64_t qGroupSize,
+ const at::Tensor& qScale, // [k/group_size, N]
+ const at::Tensor& qZeros) { // [k/group_size, N/8]
+    return xpu::_weight_int4pack_mm_with_scales_and_zeros_xpu(A, B, qGroupSize, qScale, qZeros);
   }
 
 } // namespace at::native

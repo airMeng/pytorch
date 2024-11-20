@@ -25,8 +25,8 @@ sycl::event woq_matmul_int4(
     const Tensor& mat2_, // quantized weight, [K/8, N]  ao: [K1, N1]
     const Tensor& scale, // [K/group_size, N] ao: [N1, K]
     const Tensor& zp, // [k/group_size, N/8] ao: [N1, K]
-    int64_t group_size,
     bool m2_trans,
+    int64_t group_size,
     Attr attr,
     // const c10::optional<Tensor>& g_idx,  // disable input_order
     const std::vector<sycl::event>& deps,
